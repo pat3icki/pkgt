@@ -12,7 +12,7 @@ import (
 type Config struct {
 	// EnvPath is the path to the .env file.
 	// - If it is a relative path, it will be resolved relative to the project root
-	//   (the directory containing go.mod).
+	//   (the directory containing go.mod or go.sum).
 	// - If it is an absolute path, it will be used as-is.
 	// - If left empty, it defaults to ".env" at the project root.
 	EnvPath string
@@ -23,7 +23,7 @@ type Config struct {
 }
 
 // Map locates and parses the specified env file, returning its contents as a map.
-// It automatically resolves relative paths against the project root (where go.mod is located),
+// It automatically resolves relative paths against the project root (where go.mod/go.sum is located),
 // making it reliable regardless of the current working directory (e.g., when running tests from an IDE).
 func Map(cfg *Config) (map[string]string, error) {
 	if cfg == nil {
@@ -56,6 +56,7 @@ func Map(cfg *Config) (map[string]string, error) {
 		}
 		return nil, errors.New(errMsg)
 	}
+
 	if info.IsDir() {
 		errMsg := "envt: path is a directory, not a file: " + envPath
 		if cfg.PanicErr {
@@ -78,28 +79,51 @@ func Map(cfg *Config) (map[string]string, error) {
 }
 
 // findProjectRoot walks up the directory tree from the caller's file location
-// to find the root of the Go module (indicated by the presence of a go.mod file).
+// to find the root of the Go module (indicated by the presence of a go.mod or go.sum file).
 func findProjectRoot() (string, error) {
-	// runtime.Caller(1) gets the file that called envt.Map, ensuring we start
-	// searching from within your codebase, immune to CWD changes.
 	_, filename, _, ok := runtime.Caller(1)
 	if !ok {
 		return "", errors.New("envt: cannot get caller info to determine project root")
 	}
 
 	dir := filepath.Dir(filename)
-
 	for {
 		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir, nil
+		}
+		if _, err := os.Stat(filepath.Join(dir, "go.sum")); err == nil {
 			return dir, nil
 		}
 
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return "", errors.New("envt: go.mod not found; are you inside a Go module?")
+			return "", errors.New("envt: go.mod/go.sum not found; are you inside a Go module?")
 		}
 		dir = parent
 	}
+}
+
+// WriteFile writes data to the specified file.
+// If name is a relative path, it is resolved relative to the project root
+// (the directory containing go.mod or go.sum), making it an absolute path.
+// If name is an absolute path, it is used as-is.
+// It also ensures that the parent directory exists before writing.
+func WriteFile(name string, data []byte, perm os.FileMode) error {
+	if !filepath.IsAbs(name) {
+		root, err := findProjectRoot()
+		if err != nil {
+			return err
+		}
+		name = filepath.Join(root, name)
+	}
+
+	// Ensure the parent directory exists
+	dir := filepath.Dir(name)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+
+	return os.WriteFile(name, data, perm)
 }
 
 // parseEnvFile reads and parses a .env file into a map of key-value pairs.
@@ -140,11 +164,9 @@ func parseEnvFile(filePath string) (map[string]string, error) {
 		if len(value) >= 2 {
 			firstChar := value[0]
 			lastChar := value[len(value)-1]
-
 			if (firstChar == '"' && lastChar == '"') || (firstChar == '\'' && lastChar == '\'') {
 				// Remove the surrounding quotes
 				value = value[1 : len(value)-1]
-
 				// Only unescape double-quoted strings (single quotes are literal)
 				if firstChar == '"' {
 					value = unescapeDoubleQuotedString(value)
